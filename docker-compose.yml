@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: commerce_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-commerce}
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      COMMERCE_APP_PASSWORD: ${COMMERCE_APP_PASSWORD}
+      COMMERCE_READONLY_PASSWORD: ${COMMERCE_READONLY_PASSWORD}
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD}
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${POSTGRES_DB:-commerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  adminer:
+    image: adminer:latest
+    container_name: commerce_adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

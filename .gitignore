@@ -141,6 +141,8 @@ mnesia/
 rabbitmq/
 rabbitmq-data/
 
+real_time_commerce_data_platform.md
+
 # ActiveMQ
 activemq-data/
 
