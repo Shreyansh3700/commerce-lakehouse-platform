@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     sim_shipment_changes_per_min: float = 30
     sim_profile_updates_per_min: float = 5
     sim_price_stock_changes_per_min: float = 10
+    sim_order_item_deletions_per_min: float = 5
 
     @property
     def dsn(self) -> str:

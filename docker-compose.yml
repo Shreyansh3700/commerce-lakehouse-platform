@@ -39,5 +39,167 @@ services:
       postgres:
         condition: service_healthy
 
+  # --- Phase 2: CDC / Kafka / Iceberg Bronze -------------------------------
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: commerce_kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: NEkAXOKZSyeOra1BfRMasg
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-9094}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xmx768m -Xms512m"
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-9094}:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    mem_limit: 1200m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  kafka-connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: commerce_kafka_connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: commerce-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KAFKA_HEAP_OPTS: "-Xmx768m -Xms512m"
+    ports:
+      - "${KAFKA_CONNECT_PORT:-8083}:8083"
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  connect-init:
+    image: curlimages/curl:8.10.1
+    container_name: commerce_connect_init
+    restart: "no"
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+    environment:
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD}
+      CONNECT_URL: http://kafka-connect:8083
+    volumes:
+      - ./ingestion/debezium:/ingestion/debezium:ro
+    entrypoint: ["/bin/sh", "/ingestion/debezium/register-connector.sh"]
+
+  minio:
+    image: minio/minio:latest
+    container_name: commerce_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: commerce_minio_init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mc mb --ignore-existing local/$$LAKEHOUSE_BUCKET
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: commerce_nessie
+    restart: unless-stopped
+    # The image's default non-root user can't write to a freshly-created
+    # named volume (owned by root); run as root to avoid a chown init step.
+    user: "0:0"
+    environment:
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /nessie_data/rocksdb
+      JAVA_OPTS_APPEND: "-Xmx512m"
+    ports:
+      - "${NESSIE_PORT:-19120}:19120"
+    volumes:
+      - nessie_data:/nessie_data
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  spark-bronze-writer:
+    build:
+      context: .
+      dockerfile: streaming/pyspark/Dockerfile
+    container_name: commerce_spark_bronze_writer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      connect-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      NESSIE_URI: http://nessie:19120/api/v1
+      NESSIE_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH:-main}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    mem_limit: 2560m
+
 volumes:
   postgres_data:
+  kafka_data:
+  minio_data:
+  nessie_data:
