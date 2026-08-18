@@ -279,6 +279,35 @@ def event_order_cancellation(state: SimulatorState) -> None:
     log_mutation("order_cancelled", order_id=order_id)
 
 
+def event_delete_order_item(state: SimulatorState) -> None:
+    """Deletes one line item from a still-PLACED order (removed pre-payment).
+    Hard delete on a leaf table -- see docs/data_model.md's per-entity
+    delete-strategy table. Never deletes an order's last remaining item."""
+    candidates = [oid for oid, status in state.open_orders.items() if status == "PLACED"]
+    if not candidates:
+        return
+    rng = state.rng
+    order_id = rng.choice(candidates)
+
+    with state.conn.cursor() as cur:
+        cur.execute(
+            "SELECT order_item_id, quantity, unit_price FROM commerce.order_items WHERE order_id = %s",
+            (order_id,),
+        )
+        items = cur.fetchall()
+    if len(items) <= 1:
+        return
+
+    item_id, quantity, unit_price = rng.choice(items)
+    state.conn.execute("DELETE FROM commerce.order_items WHERE order_item_id = %s", (item_id,))
+    removed_amount = float(unit_price) * quantity
+    state.conn.execute(
+        "UPDATE commerce.orders SET total_amount = GREATEST(total_amount - %s, 0) WHERE order_id = %s",
+        (removed_amount, order_id),
+    )
+    log_mutation("order_item_deleted", order_id=order_id, order_item_id=item_id)
+
+
 def event_inventory_restock(state: SimulatorState) -> None:
     if state.max_product_id < 1 or not state.warehouse_ids:
         return
@@ -351,6 +380,7 @@ def _build_schedule(settings: Settings) -> list[RatedEvent]:
         RatedEvent("inventory_restock", settings.sim_inventory_changes_per_min, event_inventory_restock),
         RatedEvent("profile_update", settings.sim_profile_updates_per_min, event_profile_update),
         RatedEvent("price_stock_change", settings.sim_price_stock_changes_per_min, event_price_stock_change),
+        RatedEvent("delete_order_item", settings.sim_order_item_deletions_per_min, event_delete_order_item),
     ]
 
 
