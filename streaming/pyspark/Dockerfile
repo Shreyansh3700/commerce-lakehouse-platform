@@ -26,13 +26,23 @@ RUN set -eux; \
     fetch "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
 
 WORKDIR /opt/spark-app
-# Build context is the repo root (see docker-compose.yml's build.context)
-# so this Dockerfile can also reach infrastructure/iceberg/bronze_ddl.sql.
-COPY streaming/pyspark/spark_session.py streaming/pyspark/debezium_envelope.py streaming/pyspark/bronze_writer.py ./
+# Build context is the repo root (see docker-compose.yml's build.context) so
+# this Dockerfile can also reach infrastructure/iceberg/*.sql. One image
+# backs both the Bronze and Silver writers (spark-bronze-writer /
+# spark-silver-writer compose services) -- they share the same JAR set, and
+# each service selects its entrypoint script via `command:` (see below).
+COPY streaming/pyspark/spark_session.py streaming/pyspark/debezium_envelope.py streaming/pyspark/bronze_writer.py \
+     streaming/pyspark/silver_schemas.py streaming/pyspark/silver_tables.py streaming/pyspark/silver_transform.py \
+     streaming/pyspark/scd2.py streaming/pyspark/silver_writer.py ./
 COPY infrastructure/iceberg/bronze_ddl.sql /opt/spark-app/bronze_ddl.sql
+COPY infrastructure/iceberg/silver_ddl.sql /opt/spark-app/silver_ddl.sql
+COPY infrastructure/iceberg/gold_ddl.sql /opt/spark-app/gold_ddl.sql
 
 USER 185
 
-# --driver-memory sized to fit within the compose service's 2560m mem_limit,
-# leaving headroom for JVM/off-heap overhead outside the heap itself.
-ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[*]", "--driver-memory", "1536m", "/opt/spark-app/bronze_writer.py"]
+# --driver-memory sized to fit within the compose services' 2560m mem_limit,
+# leaving headroom for JVM/off-heap overhead outside the heap itself. The
+# target script (bronze_writer.py or silver_writer.py) is supplied by each
+# compose service's `command:`, not hardcoded here.
+ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[*]", "--driver-memory", "1536m"]
+CMD ["/opt/spark-app/bronze_writer.py"]

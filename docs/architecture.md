@@ -10,7 +10,7 @@ components are documented here as they're implemented.
 |---|---|---|
 | 1 | Postgres schema + data generator | Done |
 | 2 | Debezium/Kafka CDC + Iceberg Bronze | Done |
-| 3 | Silver/Gold + dbt + data quality | Not started |
+| 3 | Silver/Gold (plain PySpark batch, not dbt -- see ADR 0007) + data quality | Done |
 | 4 | Streaming analytics (PySpark) + late events + schema evolution | Not started |
 | 5 | Airflow + Prometheus/Grafana + OpenLineage/Marquez + FastAPI + benchmarks | Not started |
 
@@ -70,3 +70,55 @@ Kafka message is quarantined to both a `.dlq` topic and `bronze.dlq_events`
 without stopping the rest of the batch.
 
 Details: [cdc.md](cdc.md), ADRs [0003](decisions/0003-kraft-no-zookeeper.md)-[0006](decisions/0006-dlq-lives-in-bronze-writer-not-kafka-connect.md).
+
+## Phase 3: Silver (CDC merge) / Gold (plain PySpark batch) / Data quality
+
+```
+Iceberg Bronze (bronze.<table>_cdc)
+    |
+    v
+streaming/pyspark/silver_writer.py (PySpark Structured Streaming,
+    one generic app, 7 queries, 30s micro-batch: readStream.format("iceberg")
+    per Bronze table -- not Kafka -- foreachBatch -> validate -> dedupe
+    (event_id) -> order-by-source_lsn -> MERGE INTO, guarded by
+    source.source_lsn > target._source_lsn on every match)
+    |
+    +--> Iceberg Silver (silver.customers/products/orders/order_items/
+    |    payments/inventory/shipments + silver.dlq_events) -- current
+    |    state, one row per PK; order_items/inventory hard-deleted,
+    |    everything else defensively soft-deleted (is_deleted/deleted_at)
+    |
+    +--> gold.dim_customer_history (SCD2, built by the same customers
+         batch handler via streaming/pyspark/scd2.py, not by the Gold
+         builder below -- SCD2 needs the ordered change stream Silver's
+         current-state MERGE already discards)
+    |
+    v
+batch/pyspark/gold_builder.py (plain Spark SQL, one-shot container,
+    Iceberg/Nessie/S3A config mirroring the Spark writers -- no dbt, see
+    ADR 0007) staging views -> intermediate (int_orders_enriched) -> gold
+    (daily_sales, product_performance, customer_lifetime_value,
+    inventory_health, order_fulfillment_metrics, payment_metrics)
+    |
+    v
+Iceberg Gold (gold.*)
+```
+
+`data_quality/` (Great Expectations against Silver, Spark DataFrame engine)
+gates Gold publication: `make gold-build` runs `dq-check` first and only
+proceeds to `gold-build-run`/`gold-test` if there are zero CRITICAL failures
+-- enforced today by Make's prerequisite-ordering/fail-fast semantics,
+mapping directly onto an Airflow task dependency once Phase 5 adds Airflow.
+Every run writes results to `nessie.audit.dq_results` (pass/fail, severity,
+violation count, sample PKs).
+
+New services in `docker-compose.yml`: `spark-silver-writer`
+(`restart: unless-stopped`, same image as `spark-bronze-writer` via
+`command:`); `gold-builder` and `dq` (`profiles: ["tools"]` -- one-shot, run
+via `docker compose run --rm --profile tools ...`, not started by a plain
+`docker compose up`). No Trino service yet -- the Gold builder runs directly
+against Spark; Trino is deferred to whichever later phase adds interactive
+BI/API serving, since it has no consumer in this project until then -- see
+[ADR 0007](decisions/0007-plain-pyspark-gold-not-dbt.md).
+
+Details: [data_quality.md](data_quality.md).

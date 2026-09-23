@@ -2,9 +2,10 @@
 
 A production-style, end-to-end real-time commerce data platform: PostgreSQL
 (CDC via Debezium) -> Kafka -> PySpark -> Apache Iceberg lakehouse
-(Bronze/Silver/Gold) -> Trino/dbt -> FastAPI, with Airflow orchestration,
-Great Expectations data quality, Prometheus/Grafana monitoring, and
-OpenLineage/Marquez lineage.
+(Bronze/Silver/Gold) -> FastAPI, with Airflow orchestration, Great
+Expectations data quality, Prometheus/Grafana monitoring, and
+OpenLineage/Marquez lineage. Gold is built with plain PySpark batch jobs,
+not dbt -- see [ADR 0007](docs/decisions/0007-plain-pyspark-gold-not-dbt.md).
 
 Full requirements: [`real_time_commerce_data_platform.md`](real_time_commerce_data_platform.md).
 Architecture and phase status: [`docs/architecture.md`](docs/architecture.md).
@@ -13,7 +14,7 @@ This is being built in 5 phases rather than all at once:
 
 1. **Postgres schema + data generator** -- done
 2. **Debezium/Kafka CDC + Iceberg Bronze** -- done (this README covers both)
-3. Silver/Gold (Iceberg current-state + analytics) + dbt + data quality
+3. **Silver/Gold (Iceberg current-state + analytics) + data quality** -- done
 4. Streaming analytics (PySpark) + late-arriving events + schema evolution
 5. Airflow + Prometheus/Grafana + OpenLineage/Marquez + FastAPI + benchmarks
 
@@ -103,10 +104,6 @@ MinIO's console is at `http://localhost:9001`, Nessie's API at
 
 ### Known limitations (Phase 2)
 
-- No Silver/Gold, dbt, or data-quality layer yet -- Bronze only. Duplicate
-  rows are possible in Bronze across a crash boundary (documented as
-  effectively-once in `docs/cdc.md`); deduplication happens in Phase 3's
-  Silver MERGE, not here.
 - Full Prometheus/Grafana consumer-lag dashboards are Phase 5 scope; today,
   progress is only visible via each streaming query's own log output
   (`make consumer-lag`).
@@ -114,3 +111,66 @@ MinIO's console is at `http://localhost:9001`, Nessie's API at
   silently if a matching row/stock isn't found) rather than transactional,
   since it's simulating client-side application behavior, not implementing
   correctness guarantees the platform itself must provide.
+
+## Phase 3: Silver (CDC merge) / Gold (plain PySpark batch) / Data Quality
+
+A second long-running PySpark Structured Streaming app
+(`streaming/pyspark/silver_writer.py`) reads each Bronze CDC table
+incrementally via Iceberg's own streaming read (not Kafka), and per
+micro-batch: validates, deduplicates by `event_id`, orders by Postgres WAL
+`source_lsn` (never ingestion time), and applies a `MERGE INTO` guarded by
+`source.source_lsn > target._source_lsn` -- the mechanism that makes
+cross-batch duplicates and out-of-order replays safe no-ops, not just a
+claim. `order_items`/`inventory` are hard-deleted (genuinely deleted at
+source); everything else gets a defensive soft-delete
+(`is_deleted`/`deleted_at`), since the source never actually deletes them.
+The same customers batch also maintains `gold.dim_customer_history` (SCD2)
+via `streaming/pyspark/scd2.py`, reusing the already-deduped/ordered batch --
+SCD2 needs the ordered change stream, which current-state Silver has already
+discarded.
+
+`batch/pyspark/gold_builder.py` (plain Python + Spark SQL, run as a one-shot
+container, not a standing service -- no dbt, see
+[ADR 0007](docs/decisions/0007-plain-pyspark-gold-not-dbt.md)) builds the six
+required Gold tables from Silver: staging views -> `int_orders_enriched` ->
+`daily_sales` (the one incremental table, a hand-written `MERGE INTO` with a
+3-day lookback -- Silver is mutable current-state, so a naive append-only
+incremental would miss retroactive changes like late cancellations),
+`product_performance`, `customer_lifetime_value`, `inventory_health`,
+`order_fulfillment_metrics`, `payment_metrics`. `batch/pyspark/gold_tests.py`
+runs a handful of plain assertion checks afterward (grain not-null/unique
+per table, plus two cross-Silver business rules not already covered by
+`data_quality/`'s checks).
+
+`data_quality/` (Great Expectations, Spark DataFrame engine) validates Silver
+and gates Gold publication: `make gold-build` runs `dq-check` first and only
+proceeds to `gold-build-run`/`gold-test` on zero CRITICAL failures. See
+[docs/data_quality.md](docs/data_quality.md) for the full severity model and
+suite/table mapping.
+
+### Quickstart (continued)
+
+```bash
+make silver-progress   # Silver writer's own per-table streaming progress
+make dq-check           # standalone DQ run (non-blocking, for visibility)
+make gold-build          # dq-check -> gold-build-run -> gold-test (the real gate)
+make query-gold           # ad hoc SELECT against gold.daily_sales
+```
+
+### Design decisions (continued)
+
+- [ADR 0007: Gold built with a plain PySpark batch job, not dbt; Trino still deferred](docs/decisions/0007-plain-pyspark-gold-not-dbt.md)
+
+### Known limitations (Phase 3)
+
+- `customer_lifetime_value.lifetime_value` is currently just an alias for
+  `total_spend` -- a placeholder column, kept distinct from `total_spend` so
+  a future predictive/discounted-LTV model doesn't force a rename.
+- `daily_sales`'s incremental build only re-aggregates orders whose
+  `updated_at` changed in the last 3 days after the first run; a change
+  older than that needs a manual full rebuild (truncate
+  `nessie.gold.daily_sales` and re-run `make gold-build-run`) to be
+  reflected.
+- No Prometheus/Grafana or Airflow yet (Phase 5) -- `nessie.audit.dq_results`
+  exists today specifically so those dashboards have historical data to read
+  once Phase 5 adds them.
