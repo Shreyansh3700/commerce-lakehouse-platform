@@ -179,6 +179,7 @@ services:
       dockerfile: streaming/pyspark/Dockerfile
     container_name: commerce_spark_bronze_writer
     restart: unless-stopped
+    command: ["/opt/spark-app/bronze_writer.py"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -197,6 +198,72 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     mem_limit: 2560m
+
+  # --- Phase 3: Silver (CDC merge) / Gold (plain PySpark batch) / Data quality
+
+  spark-silver-writer:
+    build:
+      context: .
+      dockerfile: streaming/pyspark/Dockerfile
+    container_name: commerce_spark_silver_writer
+    restart: unless-stopped
+    command: ["/opt/spark-app/silver_writer.py"]
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      NESSIE_URI: http://nessie:19120/api/v1
+      NESSIE_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH:-main}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      SILVER_TRIGGER_SECONDS: ${SILVER_TRIGGER_SECONDS:-30}
+    mem_limit: 2560m
+
+  # gold-builder and dq are one-shot tools, not standing services --
+  # `profiles: ["tools"]` keeps them out of a plain `docker compose up`; run
+  # them via `docker compose run --rm --profile tools <service> ...` (see
+  # Makefile).
+  gold-builder:
+    build:
+      context: .
+      dockerfile: batch/pyspark/Dockerfile
+    container_name: commerce_gold_builder
+    profiles: ["tools"]
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      NESSIE_URI: http://nessie:19120/api/v1
+      NESSIE_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH:-main}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+  dq:
+    build:
+      context: .
+      dockerfile: data_quality/Dockerfile
+    container_name: commerce_dq
+    profiles: ["tools"]
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      NESSIE_URI: http://nessie:19120/api/v1
+      NESSIE_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH:-main}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
 
 volumes:
   postgres_data:
