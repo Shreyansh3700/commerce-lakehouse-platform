@@ -1,0 +1,17 @@
+-- Schema-evolution demo (Part C, Phase 4; see docs/decisions/0002-schema-
+-- evolution-timing.md and docs/decisions/0008-schema-evolution-strategy.md).
+--
+-- Unlike infrastructure/postgres/init/, which Postgres only ever runs once
+-- at container creation, this `migrations/` directory holds ALTERs meant to
+-- be applied on demand against an ALREADY-RUNNING database/CDC pipeline --
+-- the whole point of the demo is to observe this change propagate live
+-- through Debezium -> Kafka -> Bronze -> Silver -> Gold, which is only
+-- possible once that pipeline already exists and is running. Apply via
+-- `make schema-evolve-add-discount` (docker compose exec postgres psql -f).
+--
+-- This is the additive-column case: NOT NULL DEFAULT 0 backfills every
+-- existing row at the source in the same statement, so no row is ever left
+-- without a value. Modeled as NUMERIC(10,2), matching order_items.unit_price/
+-- products.price's precision (a per-order discount is bounded well under
+-- orders.total_amount's NUMERIC(12,2) range).
+ALTER TABLE commerce.orders ADD COLUMN discount_amount NUMERIC(10,2) NOT NULL DEFAULT 0;

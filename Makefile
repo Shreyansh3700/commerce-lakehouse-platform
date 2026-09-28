@@ -1,6 +1,8 @@
 .PHONY: up down ps logs psql install seed seed-reset generate reset-db test \
 	register-connector connector-status topics consumer-lag silver-progress \
-	gold-build-run gold-test dq-check gold-build query-gold
+	gold-build-run gold-test dq-check gold-build query-gold \
+	analytics-progress query-analytics top-products \
+	schema-evolve-add-discount schema-evolve-rename-carrier detect-schema-drift
 
 up:
 	docker compose up -d
@@ -77,3 +79,40 @@ gold-build: dq-check gold-build-run gold-test
 
 query-gold:
 	docker compose run --rm --profile tools dq /opt/spark-app/spark_query.py --sql "SELECT * FROM nessie.gold.daily_sales ORDER BY date"
+
+# --- Phase 4: Streaming analytics / late-arriving events / schema evolution
+
+# Same log-grep pattern as consumer-lag/silver-progress -- see docs/cdc.md.
+analytics-progress:
+	docker compose logs spark-analytics-writer --since 5m | grep -A 15 "Streaming query made progress"
+
+# Defaults to orders_per_minute (the metric the Phase 4 verification plan's
+# late-event scenarios exercise most); query any other nessie.analytics.*
+# table directly via `docker compose run --rm --profile tools dq
+# /opt/spark-app/spark_query.py --sql "..."`.
+query-analytics:
+	docker compose run --rm --profile tools dq /opt/spark-app/spark_query.py --sql "SELECT * FROM nessie.analytics.orders_per_minute ORDER BY window_start DESC LIMIT 20"
+
+# "Top products" is a plain ranking query over product_activity's windowed
+# per-product aggregates, not hand-rolled streaming top-N state -- see
+# analytics_config.py's WINDOWED_METRIC_CONFIGS docstring.
+top-products:
+	docker compose run --rm --profile tools dq /opt/spark-app/spark_query.py --sql "SELECT product_id, SUM(quantity) AS total_quantity, SUM(revenue) AS total_revenue FROM nessie.analytics.product_activity GROUP BY product_id ORDER BY total_quantity DESC LIMIT 10"
+
+# Schema-evolution demo (spec section 18, Scenario 7) -- applies an ALTER
+# against the already-running Postgres source; see
+# infrastructure/postgres/migrations/'s header comments and
+# docs/decisions/0008-schema-evolution-strategy.md for what to observe
+# propagate afterward.
+schema-evolve-add-discount:
+	docker compose exec postgres psql -U $${POSTGRES_SUPERUSER:-postgres} -d $${POSTGRES_DB:-commerce} -f /migrations/001_add_orders_discount_amount.sql
+
+schema-evolve-rename-carrier:
+	docker compose exec postgres psql -U $${POSTGRES_SUPERUSER:-postgres} -d $${POSTGRES_DB:-commerce} -f /migrations/002_rename_shipments_carrier_to_carrier_name.sql
+
+# Non-blocking diagnostic (unlike dq-check/gold-build's gate) -- a schema-
+# drift finding needs a human to decide how to handle it. Usage:
+# `make detect-schema-drift TABLE=orders` (defaults to orders).
+TABLE ?= orders
+detect-schema-drift:
+	docker compose run --rm --profile tools dq /opt/spark-app/detect_schema_drift.py --table $(TABLE)

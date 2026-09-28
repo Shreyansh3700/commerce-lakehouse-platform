@@ -6,9 +6,10 @@ from functools import reduce
 from operator import and_
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, concat, from_json, lit, row_number, when
+from pyspark.sql.functions import coalesce, col, concat, from_json, lit, row_number, when
+from pyspark.sql.types import StructType
 from pyspark.sql.window import Window
-from silver_schemas import DECIMAL_CAST_FIELDS, ENTITY_SCHEMAS
+from silver_schemas import DECIMAL_CAST_FIELDS, ENTITY_SCHEMAS, EXTRA_PARSE_FIELDS, FIELD_COALESCE
 from silver_tables import TableConfig
 
 logger = logging.getLogger("silver_transform")
@@ -65,9 +66,17 @@ def validate(batch_df: DataFrame, table_config: TableConfig) -> tuple[DataFrame,
     entity_fields = [f.name for f in entity_schema.fields]
     pk_cols = table_config.pk_cols
 
+    # parse_schema is entity_schema plus any EXTRA_PARSE_FIELDS for this
+    # entity (e.g. shipments' post-rename `carrier_name` key) -- used ONLY to
+    # build the from_json call below, never to derive entity_fields. This is
+    # what lets a renamed source column's old and new JSON keys both parse
+    # without either one becoming a second Silver output column. See
+    # silver_schemas.py's EXTRA_PARSE_FIELDS/FIELD_COALESCE docstrings.
+    parse_schema = StructType(entity_schema.fields + EXTRA_PARSE_FIELDS.get(table_config.entity, []))
+
     payload_col = when(col("operation") == "d", col("before")).otherwise(col("after"))
-    typed_col = when(col("operation") == "d", from_json(col("before"), entity_schema)).otherwise(
-        from_json(col("after"), entity_schema)
+    typed_col = when(col("operation") == "d", from_json(col("before"), parse_schema)).otherwise(
+        from_json(col("after"), parse_schema)
     )
 
     df = batch_df.withColumn("_typed", typed_col)
@@ -92,8 +101,17 @@ def validate(batch_df: DataFrame, table_config: TableConfig) -> tuple[DataFrame,
 
     entity_col_exprs = []
     decimal_casts = DECIMAL_CAST_FIELDS.get(table_config.entity, {})
+    field_coalesce = FIELD_COALESCE.get(table_config.entity, {})
     for field in entity_fields:
-        field_col = col(f"_typed.{field}")
+        coalesce_sources = field_coalesce.get(field)
+        if coalesce_sources:
+            # Renamed source column (see silver_schemas.py's FIELD_COALESCE
+            # docstring): prefer the new JSON key, falling back to the old
+            # one for pre-rename/replayed events -- both resolve to this one
+            # Silver output column.
+            field_col = coalesce(*[col(f"_typed.{src}") for src in coalesce_sources])
+        else:
+            field_col = col(f"_typed.{field}")
         cast_type = decimal_casts.get(field)
         if cast_type:
             field_col = field_col.cast(cast_type)

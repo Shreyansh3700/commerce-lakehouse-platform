@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     sim_new_customers_per_min: float = 5
     sim_new_orders_per_min: float = 50
+    sim_late_orders_per_min: float = 2
     sim_order_status_changes_per_min: float = 40
     sim_payment_changes_per_min: float = 40
     sim_inventory_changes_per_min: float = 20

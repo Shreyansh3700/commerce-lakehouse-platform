@@ -36,7 +36,9 @@ WORKDIR /opt/spark-app
 # Bronze/Silver's own module -- copied in here too (rather than shared via
 # a volume) since each Docker image in this project is self-contained.
 COPY streaming/pyspark/spark_session.py /opt/spark-app/spark_session.py
+COPY streaming/pyspark/silver_schemas.py /opt/spark-app/silver_schemas.py
 COPY scripts/spark_query.py /opt/spark-app/spark_query.py
+COPY scripts/detect_schema_drift.py /opt/spark-app/detect_schema_drift.py
 COPY data_quality/runner.py data_quality/severity.py data_quality/ge_helpers.py /opt/spark-app/
 COPY data_quality/checks/ /opt/spark-app/checks/
 COPY data_quality/suites/ /opt/spark-app/suites/
@@ -46,5 +48,9 @@ USER 185
 # CMD (not baked into ENTRYPOINT) so `docker compose run --rm dq
 # /opt/spark-app/spark_query.py --sql "..."` can swap in a different script
 # while still going through spark-submit with the same --master flag.
-ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[*]"]
+#
+# local[2] (not local[*]): same reasoning as batch/pyspark/Dockerfile -- this
+# typically runs alongside the 3 long-running writers (also capped to
+# local[2]), so it shouldn't claim every host core for itself either.
+ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[2]"]
 CMD ["/opt/spark-app/runner.py"]

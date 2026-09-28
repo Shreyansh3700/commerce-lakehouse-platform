@@ -52,6 +52,13 @@ ORDERS_SCHEMA = StructType(
         StructField("customer_id", LongType()),
         StructField("order_status", StringType()),
         StructField("total_amount", StringType()),  # DECIMAL(12,2) source
+        # Added in Phase 4's schema-evolution demo (see
+        # infrastructure/postgres/migrations/001_add_orders_discount_amount.sql
+        # and docs/decisions/0008-schema-evolution-strategy.md). Absent from
+        # pre-migration Bronze envelopes -- from_json silently leaves it null
+        # for those, which is exactly the additive-column safety property
+        # being demonstrated.
+        StructField("discount_amount", StringType()),  # DECIMAL(10,2) source
         StructField("created_at", TimestampType()),
         StructField("updated_at", TimestampType()),
     ]
@@ -120,7 +127,49 @@ ENTITY_SCHEMAS: dict[str, StructType] = {
 # CAST after from_json (see decimal.handling.mode=string note above).
 DECIMAL_CAST_FIELDS: dict[str, dict[str, str]] = {
     "products": {"price": "DECIMAL(10,2)"},
-    "orders": {"total_amount": "DECIMAL(12,2)"},
+    "orders": {"total_amount": "DECIMAL(12,2)", "discount_amount": "DECIMAL(10,2)"},
     "order_items": {"unit_price": "DECIMAL(10,2)"},
     "payments": {"amount": "DECIMAL(12,2)"},
+}
+
+# ---------------------------------------------------------------------------
+# Rename handling (shipments.carrier -> carrier_name): the expand-contract
+# read side of Part C's schema-evolution demo. See docs/decisions/0008-
+# schema-evolution-strategy.md for the general rule; this is its concrete
+# application to the one rename this project demonstrates
+# (infrastructure/postgres/migrations/002_rename_shipments_carrier_to_carrier_name.sql).
+#
+# SHIPMENTS_SCHEMA above is left with ONLY `carrier` -- it doubles as both
+# (a) the from_json parse schema and (b) (via entity_fields in
+# silver_transform.py) the literal list of Silver output columns, and the
+# Silver output column must stay singular (`carrier`): downstream (Gold
+# staging views, DDL, docs) all reference `carrier`, and none of that should
+# need to change just because the *source* JSON key changed. So the extra
+# `carrier_name` key Debezium starts emitting post-rename is handled
+# entirely below, without ever becoming a second Silver column.
+# ---------------------------------------------------------------------------
+
+# entity -> extra StructFields that must be recognized when parsing Bronze's
+# before/after JSON (so the new post-rename key doesn't just get silently
+# dropped by from_json), but that are NOT added to entity_fields / the
+# Silver output column list. silver_transform.py's validate() merges these
+# into the actual from_json parse schema; ENTITY_SCHEMAS itself is left
+# untouched so every other place that derives Silver's column list from it
+# (build_merge_sql, etc.) is unaffected.
+EXTRA_PARSE_FIELDS: dict[str, list[StructField]] = {
+    "shipments": [StructField("carrier_name", StringType())],
+}
+
+# entity -> {silver_output_column: [source JSON keys, in priority order]}.
+# silver_transform.py's validate() uses this in place of a plain
+# `col("_typed.<field>")` reference when building that Silver output
+# column's value: COALESCE(source[0], source[1], ...) picks the first
+# non-null key present on the parsed event. For shipments.carrier, that
+# means events emitted after the rename (which carry `carrier_name` and a
+# null/absent `carrier`) and pre-rename or replayed historical events
+# (which carry `carrier` and no `carrier_name`) both resolve to the correct
+# value in the single `carrier` Silver column, with no crash and no NULL
+# gap either way.
+FIELD_COALESCE: dict[str, dict[str, list[str]]] = {
+    "shipments": {"carrier": ["carrier_name", "carrier"]},
 }

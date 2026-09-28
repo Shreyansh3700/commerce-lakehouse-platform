@@ -41,14 +41,22 @@ TBLPROPERTIES ('write.target-file-size-bytes' = '134217728');
 -- Built incrementally (MERGE on `date`, 3-day updated_at lookback) by
 -- gold_builder.py's build_daily_sales() -- the one Gold table that isn't a
 -- plain full-refresh overwrite. See that function's docstring for why.
+--
+-- total_discount/net_revenue's discount term: Part C's schema-evolution demo
+-- (docs/decisions/0008-schema-evolution-strategy.md) adds
+-- orders.discount_amount at the source; total_discount surfaces it here and
+-- net_revenue is netted against it, alongside the refunds it already
+-- accounted for -- so the change is visible all the way through Gold, not
+-- just sitting unused in Silver.
 CREATE TABLE IF NOT EXISTS nessie.gold.daily_sales (
     date                 DATE,
     orders                BIGINT,
     gross_revenue          DECIMAL(18, 2),
-    net_revenue             DECIMAL(18, 2),
-    average_order_value      DECIMAL(12, 2),
-    unique_customers           BIGINT,
-    cancelled_orders             BIGINT
+    total_discount            DECIMAL(18, 2),
+    net_revenue                 DECIMAL(18, 2),
+    average_order_value           DECIMAL(12, 2),
+    unique_customers                 BIGINT,
+    cancelled_orders                    BIGINT
 )
 USING iceberg
 TBLPROPERTIES ('write.target-file-size-bytes' = '134217728');
