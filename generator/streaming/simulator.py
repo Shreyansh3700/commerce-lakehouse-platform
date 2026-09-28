@@ -5,7 +5,7 @@ import random
 import signal
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from faker import Faker
@@ -95,13 +95,19 @@ def event_new_customer(state: SimulatorState) -> None:
     log_mutation("new_customer", customer_id=customer_id)
 
 
-def event_new_order(state: SimulatorState) -> None:
+def _create_order(state: SimulatorState, event_time: datetime) -> None:
+    """Shared order-creation path for both `event_new_order` and
+    `event_late_order`. `event_time` is threaded through explicitly (rather
+    than calling `datetime.now()` in here) so a caller can commit the row to
+    Postgres right now while the order's business `created_at`/`updated_at`
+    claim an earlier moment -- this is what makes late-arriving orders
+    possible: the WAL/CDC/source_lsn timestamp is always "now", but the
+    event-time payload consumers key off of can be backdated."""
     if state.max_customer_id < 1 or state.max_product_id < 1:
         return
     rng = state.rng
     order_id = state.next_order_id
     customer_id = rng.randint(1, state.max_customer_id)
-    now = datetime.now(timezone.utc)
 
     num_items = rng.randint(1, 4)
     product_ids = [rng.randint(1, state.max_product_id) for _ in range(num_items)]
@@ -118,7 +124,7 @@ def event_new_order(state: SimulatorState) -> None:
         unit_price = round(price * rng.uniform(0.9, 1.1), 2)
         item_id = state.next_item_id
         state.next_item_id += 1
-        item_rows.append((item_id, order_id, product_id, quantity, unit_price, now, now))
+        item_rows.append((item_id, order_id, product_id, quantity, unit_price, event_time, event_time))
         total_amount += unit_price * quantity
 
     if not item_rows:
@@ -127,7 +133,7 @@ def event_new_order(state: SimulatorState) -> None:
     state.conn.execute(
         "INSERT INTO commerce.orders (order_id, customer_id, order_status, total_amount, created_at, updated_at) "
         "VALUES (%s, %s, 'PLACED', %s, %s, %s)",
-        (order_id, customer_id, round(total_amount, 2), now, now),
+        (order_id, customer_id, round(total_amount, 2), event_time, event_time),
     )
     for item in item_rows:
         state.conn.execute(
@@ -143,7 +149,7 @@ def event_new_order(state: SimulatorState) -> None:
         "INSERT INTO commerce.payments "
         "(payment_id, order_id, payment_status, payment_method, amount, created_at, updated_at) "
         "VALUES (%s, %s, 'PENDING', %s, %s, %s, %s)",
-        (payment_id, order_id, method, round(total_amount, 2), now, now),
+        (payment_id, order_id, method, round(total_amount, 2), event_time, event_time),
     )
 
     for item_id, _oid, product_id, quantity, *_ in item_rows:
@@ -158,6 +164,21 @@ def event_new_order(state: SimulatorState) -> None:
     state.next_order_id += 1
     state.open_orders[order_id] = "PLACED"
     log_mutation("new_order", order_id=order_id, customer_id=customer_id, items=len(item_rows))
+
+
+def event_new_order(state: SimulatorState) -> None:
+    _create_order(state, datetime.now(timezone.utc))
+
+
+def event_late_order(state: SimulatorState) -> None:
+    """Simulates an order whose row is committed to Postgres right now (so
+    Debezium/Kafka/source_lsn all reflect "now") but whose business
+    `created_at` claims to have happened 1-15 minutes in the past -- e.g. an
+    offline-then-synced client or a delayed batch import. Feeds the
+    late-arriving-event handling in the analytics layer (see the Phase 4
+    plan's "Late-Arriving Events" section)."""
+    event_time = datetime.now(timezone.utc) - timedelta(minutes=state.rng.uniform(1, 15))
+    _create_order(state, event_time)
 
 
 def event_payment_change(state: SimulatorState) -> None:
@@ -370,6 +391,7 @@ def _build_schedule(settings: Settings) -> list[RatedEvent]:
     return [
         RatedEvent("new_customer", settings.sim_new_customers_per_min, event_new_customer),
         RatedEvent("new_order", settings.sim_new_orders_per_min, event_new_order),
+        RatedEvent("late_order", settings.sim_late_orders_per_min, event_late_order),
         RatedEvent("payment_change", settings.sim_payment_changes_per_min, event_payment_change),
         RatedEvent("shipment_change", settings.sim_shipment_changes_per_min, event_shipment_change),
         RatedEvent(

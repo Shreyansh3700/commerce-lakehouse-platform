@@ -23,6 +23,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d:ro
+      # Phase 4 schema-evolution demo: applied on demand against the already-
+      # running database via `make schema-evolve-*`, unlike init/ above,
+      # which Postgres only ever runs once at container creation -- see
+      # infrastructure/postgres/migrations/'s header comments.
+      - ./infrastructure/postgres/migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${POSTGRES_DB:-commerce}"]
       interval: 5s
@@ -221,6 +226,35 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       SILVER_TRIGGER_SECONDS: ${SILVER_TRIGGER_SECONDS:-30}
+    mem_limit: 2560m
+
+  # --- Phase 4: Streaming analytics / late-arriving events / schema evolution
+
+  # Reads directly from the cdc.* Kafka topics (not Bronze/Silver Iceberg --
+  # see streaming/pyspark/analytics_writer.py's module docstring), so it
+  # only needs Kafka + Nessie, not Bronze/Silver to exist first.
+  spark-analytics-writer:
+    build:
+      context: .
+      dockerfile: streaming/pyspark/Dockerfile
+    container_name: commerce_spark_analytics_writer
+    restart: unless-stopped
+    command: ["/opt/spark-app/analytics_writer.py"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      NESSIE_URI: http://nessie:19120/api/v1
+      NESSIE_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH:-main}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     mem_limit: 2560m
 
   # gold-builder and dq are one-shot tools, not standing services --

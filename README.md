@@ -15,7 +15,7 @@ This is being built in 5 phases rather than all at once:
 1. **Postgres schema + data generator** -- done
 2. **Debezium/Kafka CDC + Iceberg Bronze** -- done (this README covers both)
 3. **Silver/Gold (Iceberg current-state + analytics) + data quality** -- done
-4. Streaming analytics (PySpark) + late-arriving events + schema evolution
+4. **Streaming analytics (PySpark) + late-arriving events + schema evolution** -- done
 5. Airflow + Prometheus/Grafana + OpenLineage/Marquez + FastAPI + benchmarks
 
 ## Phase 1: Postgres + Data Generator
@@ -174,3 +174,74 @@ make query-gold           # ad hoc SELECT against gold.daily_sales
 - No Prometheus/Grafana or Airflow yet (Phase 5) -- `nessie.audit.dq_results`
   exists today specifically so those dashboards have historical data to read
   once Phase 5 adds them.
+
+## Phase 4: Streaming Analytics / Late-Arriving Events / Schema Evolution
+
+A third long-running PySpark Structured Streaming app
+(`streaming/pyspark/analytics_writer.py`, `spark-analytics-writer`) reads
+directly from the `cdc.*` Kafka topics -- not Bronze/Silver Iceberg -- to
+compute real-time metrics (orders/revenue per minute, 5-minute revenue,
+payment failure rate, top products, inventory alerts), each MERGEd into a
+`nessie.analytics.*` Iceberg table every micro-batch. All windowed metrics
+are config-driven (`streaming/pyspark/analytics_config.py`) through one
+generic windowed-aggregation implementation.
+
+Late-arriving events (spec section 17) are demonstrated on order creation:
+the simulator's new `event_late_order` commits an order to Postgres right
+now but backdates its `created_at` 1-15 minutes. A 5-minute watermark on
+`orders_per_minute` absorbs backdates under that threshold into an
+already-written window; backdates beyond it would be silently dropped by
+Spark's own watermark, so a small hand-rolled check
+(`run_late_event_query`) catches those instead and appends them to
+`nessie.analytics.late_events`, a dedicated reconciliation dataset. See
+[docs/streaming_analytics.md](docs/streaming_analytics.md) for the full
+metric list and the watermark/threshold rationale.
+
+Schema evolution (spec section 18, Scenario 7) is demonstrated live against
+the already-running pipeline, per ADR 0002's plan:
+`infrastructure/postgres/migrations/` holds two on-demand `ALTER TABLE`
+statements (unlike `infrastructure/postgres/init/`, which only ever runs
+once). `make schema-evolve-add-discount` adds `orders.discount_amount` --
+Bronze needs zero changes (raw JSON, ADR 0005), and Silver picks it up via
+an idempotent, restart-safe `ALTER TABLE ... ADD COLUMN`
+(`streaming/pyspark/schema_evolution.py`), visible all the way through to
+`gold.daily_sales`'s new `total_discount`/`net_revenue` columns.
+`make schema-evolve-rename-carrier` renames `shipments.carrier` to
+`carrier_name` -- the "requires special handling" case: a rename fails
+*silently* (not loudly) for any reader still expecting the old key, so it's
+handled via expand-contract (dual-read both keys, resolve via `COALESCE`)
+rather than an in-place change. `make detect-schema-drift TABLE=orders` is a
+non-blocking, on-demand diagnostic that flags Bronze JSON keys Silver
+doesn't yet parse. See
+[ADR 0008](docs/decisions/0008-schema-evolution-strategy.md) for the general
+compatibility rules this establishes.
+
+### Quickstart (continued)
+
+```bash
+make analytics-progress          # spark-analytics-writer's own per-query streaming progress
+make query-analytics              # ad hoc SELECT against nessie.analytics.orders_per_minute
+make top-products                  # ranked SELECT against nessie.analytics.product_activity
+make schema-evolve-add-discount     # ALTER TABLE commerce.orders ADD COLUMN discount_amount ...
+make schema-evolve-rename-carrier    # ALTER TABLE commerce.shipments RENAME COLUMN carrier ...
+make detect-schema-drift TABLE=orders # non-blocking Bronze-vs-Silver schema-drift diagnostic
+```
+
+### Design decisions (continued)
+
+- [ADR 0008: Schema-evolution compatibility rules](docs/decisions/0008-schema-evolution-strategy.md)
+
+### Known limitations (Phase 4)
+
+- `orders_per_minute`/`revenue_5min` only count order-creation events
+  (`operation IN ('c','r')`) -- an order's later status changes land in the
+  same window (unchanging `created_at`) and are deliberately excluded to
+  avoid double-counting; see docs/streaming_analytics.md.
+- Silver only reflects `discount_amount` for orders touched by a CDC event
+  after the migration was applied -- an order never touched again since
+  shows `NULL`/0 in Silver until a Bronze -> Silver replay reprocesses its
+  history (same category of limitation as `daily_sales`'s incremental
+  lookback window above).
+- `shipments.carrier`'s old JSON key is still parsed indefinitely (the
+  expand-contract dual-read) -- dropping it is a documented future cleanup
+  step once no historical/replay concern remains, not implemented now.

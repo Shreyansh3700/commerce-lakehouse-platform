@@ -1,6 +1,6 @@
-# Bronze writer image: Spark + Iceberg + Nessie + S3A(MinIO) + Kafka jars
-# baked in at build time, not fetched via --packages on every container
-# restart (this service runs with `restart: unless-stopped`).
+# Bronze/Silver/Analytics writer image: Spark + Iceberg + Nessie + S3A(MinIO)
+# + Kafka jars baked in at build time, not fetched via --packages on every
+# container restart (these services run with `restart: unless-stopped`).
 FROM apache/spark:3.5.9-python3
 
 USER root
@@ -28,21 +28,42 @@ RUN set -eux; \
 WORKDIR /opt/spark-app
 # Build context is the repo root (see docker-compose.yml's build.context) so
 # this Dockerfile can also reach infrastructure/iceberg/*.sql. One image
-# backs both the Bronze and Silver writers (spark-bronze-writer /
-# spark-silver-writer compose services) -- they share the same JAR set, and
-# each service selects its entrypoint script via `command:` (see below).
+# backs the Bronze, Silver, and Analytics writers (spark-bronze-writer /
+# spark-silver-writer / spark-analytics-writer compose services) -- they
+# share the same JAR set, and each service selects its entrypoint script via
+# `command:` (see below).
 COPY streaming/pyspark/spark_session.py streaming/pyspark/debezium_envelope.py streaming/pyspark/bronze_writer.py \
      streaming/pyspark/silver_schemas.py streaming/pyspark/silver_tables.py streaming/pyspark/silver_transform.py \
-     streaming/pyspark/scd2.py streaming/pyspark/silver_writer.py ./
+     streaming/pyspark/scd2.py streaming/pyspark/silver_writer.py streaming/pyspark/schema_evolution.py \
+     streaming/pyspark/analytics_config.py streaming/pyspark/analytics_transform.py \
+     streaming/pyspark/analytics_writer.py ./
 COPY infrastructure/iceberg/bronze_ddl.sql /opt/spark-app/bronze_ddl.sql
 COPY infrastructure/iceberg/silver_ddl.sql /opt/spark-app/silver_ddl.sql
 COPY infrastructure/iceberg/gold_ddl.sql /opt/spark-app/gold_ddl.sql
+COPY infrastructure/iceberg/analytics_ddl.sql /opt/spark-app/analytics_ddl.sql
 
 USER 185
 
 # --driver-memory sized to fit within the compose services' 2560m mem_limit,
 # leaving headroom for JVM/off-heap overhead outside the heap itself. The
-# target script (bronze_writer.py or silver_writer.py) is supplied by each
-# compose service's `command:`, not hardcoded here.
-ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[*]", "--driver-memory", "1536m"]
+# target script (bronze_writer.py, silver_writer.py, or analytics_writer.py)
+# is supplied by each compose service's `command:`, not hardcoded here.
+#
+# --master local[2] (not local[*]): this image backs THREE concurrent
+# long-running writers (spark-bronze-writer/-silver-writer/-analytics-writer),
+# each running many parallel Structured Streaming queries in one JVM
+# (Bronze: 7, Silver: 7, Analytics: 6). local[*] makes each JVM claim every
+# host core for its own thread pool -- three JVMs doing that simultaneously
+# oversubscribes the same cores 3x over, which was observed to cause severe
+# enough scheduling/GC contention to sever the py4j bridge between the
+# Python driver and the JVM ("Received empty command", every in-flight job
+# failing at once after a multi-second stall) and crash-loop the writer.
+# local[4] per writer (12 threads total across the 3) still left the writers
+# crash-looping on a 16-core host -- combined measured CPU across just the 3
+# writers was ~13.6 cores even at that cap, since local[N] only bounds Spark
+# TASK threads, not JVM overhead (GC/Netty/JIT/py4j threads), which adds
+# meaningfully on top. local[2] x 3 writers = 6 task threads, leaving real
+# headroom for that overhead plus Kafka/Kafka Connect/Postgres/Nessie/MinIO.
+# Tune alongside mem_limit below if this ever runs on a different-sized host.
+ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[2]", "--driver-memory", "1536m"]
 CMD ["/opt/spark-app/bronze_writer.py"]

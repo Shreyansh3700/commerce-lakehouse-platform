@@ -50,7 +50,8 @@ STG_VIEWS: dict[str, str] = {
         FROM nessie.silver.products WHERE is_deleted = false
     """,
     "stg_orders": """
-        SELECT order_id, customer_id, order_status, total_amount, created_at, updated_at
+        SELECT order_id, customer_id, order_status, total_amount,
+            COALESCE(discount_amount, 0) AS discount_amount, created_at, updated_at
         FROM nessie.silver.orders WHERE is_deleted = false
     """,
     "stg_order_items": """
@@ -109,6 +110,7 @@ _INT_ORDERS_ENRICHED_SQL_TEMPLATE = """
         orders.customer_id,
         orders.order_status,
         orders.total_amount,
+        orders.discount_amount,
         orders.created_at,
         orders.updated_at,
         COALESCE(item_agg.item_revenue, 0) AS item_revenue,
@@ -188,15 +190,27 @@ def build_daily_sales(spark: SparkSession) -> None:
             DATE(created_at) AS date,
             CAST(COUNT(*) AS BIGINT) AS orders,
             CAST(SUM(total_amount) AS DECIMAL(18,2)) AS gross_revenue,
+            -- Part C's schema-evolution demo column (orders.discount_amount,
+            -- see docs/decisions/0008-schema-evolution-strategy.md). Summed
+            -- over the same non-CANCELLED orders gross_revenue counts, so it
+            -- lines up with net_revenue's use of it below; discount_amount
+            -- is NULL-coalesced to 0 in stg_orders for orders untouched
+            -- since the migration (documented Silver backfill limitation).
+            CAST(
+                SUM(CASE WHEN order_status != 'CANCELLED' THEN discount_amount ELSE 0 END) AS DECIMAL(18,2)
+            ) AS total_discount,
             -- REFUNDED payments only occur on CANCELLED orders per the
             -- order/payment state machine (docs/data_model.md), so
             -- excluding CANCELLED orders and subtracting refunds are
             -- currently overlapping safety nets, not double-counted
             -- correction -- kept as two explicit terms so net_revenue
-            -- stays correct if that invariant ever loosens.
+            -- stays correct if that invariant ever loosens. discount_amount
+            -- is netted out the same way, for the same non-CANCELLED orders.
             CAST(
                 SUM(CASE WHEN order_status != 'CANCELLED' THEN total_amount ELSE 0 END)
-                - SUM(refunded_payment_amount) AS DECIMAL(18,2)
+                - SUM(refunded_payment_amount)
+                - SUM(CASE WHEN order_status != 'CANCELLED' THEN discount_amount ELSE 0 END)
+                AS DECIMAL(18,2)
             ) AS net_revenue,
             CAST(SUM(total_amount) / COUNT(*) AS DECIMAL(12,2)) AS average_order_value,
             CAST(COUNT(DISTINCT customer_id) AS BIGINT) AS unique_customers,

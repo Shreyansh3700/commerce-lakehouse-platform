@@ -1,0 +1,15 @@
+-- Schema-evolution demo (Part C, Phase 4; see docs/decisions/0002-schema-
+-- evolution-timing.md and docs/decisions/0008-schema-evolution-strategy.md).
+-- Applied on demand via `make schema-evolve-rename-carrier`, same
+-- already-running-database rationale as 001_add_orders_discount_amount.sql.
+--
+-- This is the "requires special handling" case (spec section 18): unlike an
+-- additive column, a rename is NOT safe to treat as "just a new key that old
+-- readers ignore". The moment this runs, Debezium starts emitting the key as
+-- `carrier_name` instead of `carrier` in every subsequent CDC envelope --
+-- any reader still parsing for `carrier` gets a silent NULL for that field,
+-- not an error, not a crash. That silent-failure mode (not a loud one) is
+-- exactly why renames need the expand-contract treatment documented in ADR
+-- 0008, rather than an in-place ALTER handled the same way as an additive
+-- column.
+ALTER TABLE commerce.shipments RENAME COLUMN carrier TO carrier_name;

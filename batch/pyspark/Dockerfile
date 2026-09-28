@@ -38,5 +38,10 @@ USER 185
 # CMD (not baked into ENTRYPOINT) so `docker compose run --rm gold-builder
 # /opt/spark-app/gold_tests.py` can swap in the test script while still
 # going through spark-submit with the same --master flag.
-ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[*]"]
+#
+# local[2] (not local[*]): this typically runs alongside the 3 long-running
+# writers (spark-bronze/-silver/-analytics-writer, also capped to local[2] --
+# see streaming/pyspark/Dockerfile), so it shouldn't claim every host core
+# for itself either.
+ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[2]"]
 CMD ["/opt/spark-app/gold_builder.py"]

@@ -11,7 +11,7 @@ components are documented here as they're implemented.
 | 1 | Postgres schema + data generator | Done |
 | 2 | Debezium/Kafka CDC + Iceberg Bronze | Done |
 | 3 | Silver/Gold (plain PySpark batch, not dbt -- see ADR 0007) + data quality | Done |
-| 4 | Streaming analytics (PySpark) + late events + schema evolution | Not started |
+| 4 | Streaming analytics (PySpark) + late events + schema evolution | Done |
 | 5 | Airflow + Prometheus/Grafana + OpenLineage/Marquez + FastAPI + benchmarks | Not started |
 
 ## Phase 1: Postgres + Data Generator
@@ -122,3 +122,68 @@ BI/API serving, since it has no consumer in this project until then -- see
 [ADR 0007](decisions/0007-plain-pyspark-gold-not-dbt.md).
 
 Details: [data_quality.md](data_quality.md).
+
+## Phase 4: Streaming analytics / late-arriving events / schema evolution
+
+```
+cdc.orders / cdc.payments / cdc.order_items / cdc.inventory (Kafka)
+    |
+    v
+streaming/pyspark/analytics_writer.py (PySpark Structured Streaming,
+    reads Kafka DIRECTLY -- not Bronze/Silver Iceberg -- its own
+    independent consumer group per sink, coexisting with Bronze's own
+    consumption of the same topics)
+    |
+    +--> nessie.analytics.orders_per_minute / revenue_5min (1-min / 5-min
+    |    tumbling windows, watermarked, MERGEd by (window, *group keys)
+    |    every micro-batch -- restricted to insert/snapshot events only, so
+    |    an order's later status-change events don't double-count it)
+    |
+    +--> nessie.analytics.payment_failure_rate (5-min window on
+    |    payments.updated_at -- the genuine, trigger-maintained DB-commit
+    |    resolution time)
+    |
+    +--> nessie.analytics.product_activity (5-min window x product_id --
+    |    "top products" is a plain ORDER BY ... LIMIT N over this table,
+    |    make top-products, not hand-rolled streaming top-N state)
+    |
+    +--> nessie.analytics.inventory_alerts (stateless filter+append,
+    |    available_quantity <= LOW_STOCK_THRESHOLD)
+    |
+    +--> nessie.analytics.late_events (a SEPARATE streaming query against
+         cdc.orders: Spark's own watermark never exposes which rows it
+         silently dropped, so a small hand-rolled check against
+         nessie.analytics.watermark_state classifies and captures anything
+         beyond the allowed-lateness threshold instead of losing it)
+```
+
+The simulator (`generator/streaming/simulator.py`) gained `event_late_order`,
+which creates an order committed to Postgres *now* but with `created_at`
+backdated 1-15 minutes -- the concrete late-arriving-event source the
+watermark/lateness logic above reacts to. See
+[streaming_analytics.md](streaming_analytics.md) for the full metric list,
+window/watermark choices, and why the lateness demonstration is scoped to
+order creation specifically.
+
+Schema evolution (spec section 18, Scenario 7) is demonstrated live against
+the already-running pipeline via `infrastructure/postgres/migrations/`
+(`make schema-evolve-add-discount`, `make schema-evolve-rename-carrier`) --
+unlike `infrastructure/postgres/init/`, which Postgres only runs once at
+container creation. Bronze needs zero code changes for either (raw JSON,
+ADR 0005); Silver picks up the additive `orders.discount_amount` column via
+an idempotent `ALTER TABLE` (`streaming/pyspark/schema_evolution.py`,
+restart-safe the same way `CREATE TABLE IF NOT EXISTS` already is) and
+resolves the `shipments.carrier` -> `carrier_name` rename via an
+expand-contract dual-read + `COALESCE` (`silver_schemas.py`'s
+`EXTRA_PARSE_FIELDS`/`FIELD_COALESCE`) rather than an in-place change, since
+a rename fails *silently* (not loudly) for any reader still expecting the
+old key. `scripts/detect_schema_drift.py` (`make detect-schema-drift
+TABLE=orders`) is a non-blocking, on-demand diagnostic that diffs observed
+Bronze JSON keys against what Silver currently parses. See
+[ADR 0008](decisions/0008-schema-evolution-strategy.md) for the general
+backward/forward-compatibility rules this establishes.
+
+New service in `docker-compose.yml`: `spark-analytics-writer`
+(`restart: unless-stopped`, same image as Bronze/Silver via `command:`, only
+depends on Kafka + Nessie -- not Bronze/Silver -- since it reads Kafka
+directly). No new standing services beyond that.

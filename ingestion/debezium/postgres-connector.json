@@ -1,0 +1,45 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "1",
+
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "debezium",
+  "database.password": "${DEBEZIUM_PASSWORD}",
+  "database.dbname": "commerce",
+
+  "topic.prefix": "cdc",
+  "schema.include.list": "commerce",
+  "table.include.list": "commerce.customers,commerce.products,commerce.orders,commerce.order_items,commerce.payments,commerce.inventory,commerce.shipments",
+
+  "plugin.name": "pgoutput",
+  "slot.name": "commerce_cdc_slot",
+  "publication.name": "commerce_cdc",
+  "publication.autocreate.mode": "disabled",
+  "slot.drop.on.stop": "false",
+  "snapshot.mode": "initial",
+
+  "tombstones.on.delete": "false",
+  "provide.transaction.metadata": "true",
+  "decimal.handling.mode": "string",
+  "heartbeat.interval.ms": "10000",
+
+  "schema.history.internal.kafka.topic": "schema-changes.commerce",
+  "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+
+  "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "key.converter.schemas.enable": "false",
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.schemas.enable": "false",
+
+  "transforms": "route",
+  "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+  "transforms.route.regex": "cdc\\.commerce\\.(.*)",
+  "transforms.route.replacement": "cdc.$1",
+
+  "topic.creation.enable": "true",
+  "topic.creation.default.replication.factor": "1",
+  "topic.creation.default.partitions": "3",
+  "topic.creation.default.cleanup.policy": "delete",
+  "topic.creation.default.retention.ms": "259200000"
+}
